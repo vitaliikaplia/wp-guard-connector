@@ -1,8 +1,10 @@
 # WP Guard Connector
 
-WordPress plugin that connects a site to the **WP Guard** portal — a central hub
-for managing access across a fleet of WordPress sites. Pure PHP, no dependencies,
-WordPress 6.0+.
+WordPress plugin that connects a site to **[WP Guard](https://wpguard.top/)** — a
+central hub for managing access across a fleet of WordPress sites. Pure PHP, no
+dependencies, WordPress 6.0+.
+
+**Project:** https://wpguard.top/
 
 ## What it does
 
