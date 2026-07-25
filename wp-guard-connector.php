@@ -2,17 +2,20 @@
 /**
  * Plugin Name:       WP Guard Connector
  * Plugin URI:        https://wpguard.top
- * Description:        Connects this WordPress site to the WP Guard portal — secure registration by API key, an HMAC-signed channel, heartbeat, desired-state sync, one-click SSO and event streaming.
- * Version:           1.2.0
+ * Description:        Connects this WordPress site to the WP Guard portal — secure registration by API key, an HMAC-signed channel, heartbeat, desired-state sync, one-click SSO and event streaming. Self-updates from GitHub.
+ * Version:           1.3.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            WP Guard
+ * Author URI:        https://wpguard.top
+ * Plugin URI:        https://github.com/vitaliikaplia/wp-guard-connector
  * License:           GPL-2.0-or-later
  *
  * Phase 2.1: registration + signed channel + heartbeat. Phase 2.2/2.3: desired-
  * state PULL (policy enforcement + user/role reconcile). Phase 2.4: one-click
  * wp-admin SSO (redeem a one-time portal ticket, then log the managed user in).
  * Phase 2.5: stream site events (sign-ins, updates) to the portal via signed sync.
+ * Phase 2.6: self-update from the public GitHub repo's `master` branch.
  */
 
 if (!defined('ABSPATH')) {
@@ -29,9 +32,22 @@ if (defined('WPGUARD_DISABLE') && WPGUARD_DISABLE) {
     return;
 }
 
+/* Plugin identity + self-update source. Version lives in ONE place (the header is
+   parsed by WordPress and by the GitHub updater on the remote side). The branch is
+   overridable via wp-config for staging channels; default is the release branch. */
+define('WPGUARD_CONNECTOR_VERSION', '1.3.0');
+define('WPGUARD_CONNECTOR_FILE', __FILE__);
+define('WPGUARD_CONNECTOR_BASENAME', plugin_basename(__FILE__));
+define('WPGUARD_CONNECTOR_GITHUB', 'vitaliikaplia/wp-guard-connector');
+if (!defined('WPGUARD_CONNECTOR_GITHUB_BRANCH')) {
+    define('WPGUARD_CONNECTOR_GITHUB_BRANCH', 'master');
+}
+
+require_once __DIR__ . '/includes/class-wpguard-github-updater.php';
+
 final class WP_Guard_Connector {
 
-    const VERSION       = '1.2.0';
+    const VERSION       = WPGUARD_CONNECTOR_VERSION;
     const OPTION        = 'wpguard_connector';   // array: portal_url, site_id, secret, last_beat, last_status
     const EVENTS_OPTION = 'wpguard_events';      // buffered site events pending upload (autoload=no)
     const EVENTS_MAX    = 500;                    // hard cap on the buffer (drop oldest beyond this)
@@ -61,6 +77,9 @@ final class WP_Guard_Connector {
 
     public static function boot() {
         $self = self::instance();
+        // Self-update from GitHub (independent of portal connection). Registers the
+        // plugin-update-transient + plugins_api filters; the remote check is cached.
+        new WP_Guard_Connector_GitHub_Updater();
         add_action('admin_menu', array($self, 'add_settings_page'));
         add_action('admin_post_wpguard_save', array($self, 'handle_save'));
         add_action('admin_post_wpguard_beat', array($self, 'handle_manual_beat'));
