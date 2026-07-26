@@ -3,7 +3,7 @@
  * Plugin Name:       WP Guard Connector
  * Plugin URI:        https://wpguard.top
  * Description:        Connects this WordPress site to the WP Guard portal — secure registration by API key, an HMAC-signed channel, heartbeat, desired-state sync, one-click SSO and event streaming. Self-updates from GitHub.
- * Version:           1.3.0
+ * Version:           1.4.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            WP Guard
@@ -32,10 +32,19 @@ if (defined('WPGUARD_DISABLE') && WPGUARD_DISABLE) {
     return;
 }
 
+/**
+ * Channel hardening (mTLS-equivalent): the plugin verifies that the portal SIGNED its
+ * responses (per-site HMAC, bound to the request nonce) before trusting security-critical
+ * replies — the SSO identity ({uid,email,role} → wp-admin login), the /sync desired-state,
+ * and the register secret. This is on by default. As an EMERGENCY valve only (e.g. a portal
+ * rollback that ships unsigned replies), you may put  define('WPGUARD_REQUIRE_RESP_SIG', false);
+ * in wp-config.php to temporarily accept unsigned responses. Leave it ON in normal operation.
+ */
+
 /* Plugin identity + self-update source. Version lives in ONE place (the header is
    parsed by WordPress and by the GitHub updater on the remote side). The branch is
    overridable via wp-config for staging channels; default is the release branch. */
-define('WPGUARD_CONNECTOR_VERSION', '1.3.0');
+define('WPGUARD_CONNECTOR_VERSION', '1.4.0');
 define('WPGUARD_CONNECTOR_FILE', __FILE__);
 define('WPGUARD_CONNECTOR_BASENAME', plugin_basename(__FILE__));
 define('WPGUARD_CONNECTOR_GITHUB', 'vitaliikaplia/wp-guard-connector');
@@ -154,8 +163,14 @@ final class WP_Guard_Connector {
         }
         set_transient($tkey, 1, 120);
 
-        $res = $this->signed_post('/api/v1/sso/redeem', array('jti' => $jti));
+        $r = $this->signed_post('/api/v1/sso/redeem', array('jti' => $jti));
+        $res = $r['res']; $nonce = $r['nonce'];
         if (is_wp_error($res) || (int) wp_remote_retrieve_response_code($res) !== 200) {
+            $this->sso_fail();
+        }
+        // Authenticate the identity reply BEFORE trusting {uid,email,role} — a forged reply
+        // (fake portal / MITM) could otherwise log an attacker into wp-admin as administrator.
+        if (!$this->verify_signed_response($res, $nonce, $this->state()['secret'])) {
             $this->sso_fail();
         }
         $doc = json_decode(wp_remote_retrieve_body($res), true);
@@ -489,19 +504,23 @@ final class WP_Guard_Connector {
 
     /* --------------------------------------------------------------- HTTP */
 
-    /** POST a signed JSON request to a portal endpoint path. */
+    /**
+     * POST a signed JSON request to a portal endpoint path. Returns
+     * array('res' => <wp_remote_post result | WP_Error>, 'nonce' => <request nonce>) so the
+     * caller can bind the portal's RESPONSE signature to the exact request it made.
+     */
     private function signed_post($path, array $payload) {
         $origin = $this->portal_origin();
         $state  = $this->state();
         if ($origin === '' || !$this->is_connected()) {
-            return new WP_Error('not_connected', 'Not connected to a portal.');
+            return array('res' => new WP_Error('not_connected', 'Not connected to a portal.'), 'nonce' => '');
         }
         $body  = wp_json_encode($payload);
         $ts    = (string) time();
         $nonce = bin2hex(random_bytes(16));
         $sig   = $this->sign($state['secret'], 'POST', $path, $ts, $nonce, $body);
 
-        return wp_remote_post($origin . $path, array(
+        $res = wp_remote_post($origin . $path, array(
             'timeout'   => 15,
             'sslverify' => $this->ssl_verify_for($origin),
             'headers'   => array(
@@ -513,6 +532,50 @@ final class WP_Guard_Connector {
             ),
             'body'      => $body,
         ));
+        return array('res' => $res, 'nonce' => $nonce);
+    }
+
+    /** Whether to REQUIRE a valid portal response signature (mTLS-equivalent). Default: yes.
+     *  Emergency valve: define('WPGUARD_REQUIRE_RESP_SIG', false) in wp-config.php if a
+     *  portal-side rollback ever ships unsigned replies (see the file-top note). */
+    private function require_resp_sig() {
+        if (defined('WPGUARD_REQUIRE_RESP_SIG')) {
+            return (bool) WPGUARD_REQUIRE_RESP_SIG;
+        }
+        return true;
+    }
+
+    /** Verify a portal RESPONSE signature. Mirrors the portal's connector.signResponse:
+     *  canonical = "RESP\n<request-nonce>\n<resp-ts>\nsha256(body)", HMAC-SHA256 with $key
+     *  (the per-site secret for signed endpoints; sha256(api_key) for register). Constant-
+     *  time compare + a ±300s freshness window on the response timestamp. */
+    private function verify_response($body, $nonce, $resp_ts, $sig_header, $key) {
+        if ($key === '' || $sig_header === '' || $resp_ts === '') {
+            return false;
+        }
+        if (abs(time() - (int) $resp_ts) > 300) {
+            return false;
+        }
+        $sig       = (strpos($sig_header, 'sha256=') === 0) ? substr($sig_header, 7) : $sig_header;
+        $canonical = "RESP\n" . $nonce . "\n" . $resp_ts . "\n" . hash('sha256', (string) $body);
+        $expected  = hash_hmac('sha256', $canonical, (string) $key);
+        return hash_equals($expected, (string) $sig);
+    }
+
+    /** Verify a wp_remote_post RESPONSE (headers + body) bound to the request $nonce, using
+     *  $key. Returns true when enforcement is disabled; otherwise false on a missing/invalid
+     *  signature — the caller then rejects the reply (keeps prior policy / refuses SSO). */
+    private function verify_signed_response($res, $nonce, $key) {
+        if (!$this->require_resp_sig()) {
+            return true;
+        }
+        return $this->verify_response(
+            (string) wp_remote_retrieve_body($res),
+            (string) $nonce,
+            (string) wp_remote_retrieve_header($res, 'x-wpg-resp-timestamp'),
+            (string) wp_remote_retrieve_header($res, 'x-wpg-resp-signature'),
+            (string) $key
+        );
     }
 
     /* ------------------------------------------------------- register / beat */
@@ -548,6 +611,11 @@ final class WP_Guard_Connector {
             return array('ok' => false, 'error' => $res->get_error_message());
         }
         $code = wp_remote_retrieve_response_code($res);
+        // Authenticate the register reply with a key DERIVED from the API key we presented
+        // (the per-site secret it delivers can't sign itself). Register has no request nonce.
+        if ($code === 200 && !$this->verify_signed_response($res, '', hash('sha256', $api_key))) {
+            return array('ok' => false, 'error' => 'Registration response failed verification.');
+        }
         $json = json_decode(wp_remote_retrieve_body($res), true);
         if ($code !== 200 || empty($json['site_id']) || empty($json['secret'])) {
             $err = is_array($json) && !empty($json['error']) ? $json['error'] : ('HTTP ' . $code);
@@ -592,12 +660,14 @@ final class WP_Guard_Connector {
     public function sync() {
         // Piggyback any buffered site events (2.5) onto this signed pull.
         $events = $this->peek_events(100);
-        $res = $this->signed_post('/api/v1/sync', array(
+        $r = $this->signed_post('/api/v1/sync', array(
             'wp_version'     => get_bloginfo('version'),
+            'latest_core'    => $this->latest_core_version(),
             'plugin_version' => self::VERSION,
             'config_version' => $this->applied_config_version(),
             'events'         => $events,
         ));
+        $res = $r['res']; $nonce = $r['nonce'];
         if (is_wp_error($res)) {
             $this->save_state(array('last_status' => 'error: ' . $res->get_error_message()));
             return array('ok' => false, 'error' => $res->get_error_message());
@@ -614,6 +684,12 @@ final class WP_Guard_Connector {
             }
             $this->save_state($patch);
             return array('ok' => false, 'error' => 'HTTP ' . $code);
+        }
+        // Authenticate the RESPONSE before trusting the desired-state it carries. A forged
+        // /sync reply could push a hostile policy/roster; reject it and keep the current cache.
+        if (!$this->verify_signed_response($res, $nonce, $this->state()['secret'])) {
+            $this->save_state(array('last_beat' => time(), 'last_status' => 'error: bad response signature'));
+            return array('ok' => false, 'error' => 'bad_response_signature');
         }
         $doc = json_decode(wp_remote_retrieve_body($res), true);
         $this->apply_desired_state(is_array($doc) ? $doc : array());
@@ -963,14 +1039,44 @@ final class WP_Guard_Connector {
     }
 
     /**
+     * The newest WordPress core version available to THIS site, read from WordPress's
+     * OWN local update cache (the update_core transient) — no network call here; WP
+     * refreshes that cache on its twice-daily wp_version_check cron. Returns the running
+     * version when up to date, or when the update API isn't loadable in this context,
+     * and NEVER a version below the running one — so the portal's `wp_version <> latest_wp`
+     * "behind" test stays exact.
+     */
+    private function latest_core_version() {
+        $current = (string) get_bloginfo('version');
+        if (!function_exists('get_preferred_from_update_core')) {
+            $inc = ABSPATH . 'wp-admin/includes/update.php';
+            if (is_readable($inc)) {
+                require_once $inc;
+            }
+        }
+        if (!function_exists('get_preferred_from_update_core')) {
+            return $current; // update API unavailable here → safe no-op (portal keeps prior value)
+        }
+        $u = get_preferred_from_update_core();
+        if (is_object($u) && !empty($u->current) && isset($u->response)
+            && $u->response === 'upgrade'
+            && version_compare((string) $u->current, $current, '>')) {
+            return (string) $u->current;
+        }
+        return $current;
+    }
+
+    /**
      * Send a signed heartbeat. Refreshes portal-side liveness + reported versions.
      * @return array{ok:bool,error?:string}
      */
     public function heartbeat() {
-        $res = $this->signed_post('/api/v1/heartbeat', array(
+        $r = $this->signed_post('/api/v1/heartbeat', array(
             'wp_version'     => get_bloginfo('version'),
+            'latest_core'    => $this->latest_core_version(),
             'plugin_version' => self::VERSION,
         ));
+        $res = $r['res']; // heartbeat body carries no trusted data → no response-sig gate
         if (is_wp_error($res)) {
             $this->save_state(array('last_status' => 'error: ' . $res->get_error_message()));
             return array('ok' => false, 'error' => $res->get_error_message());

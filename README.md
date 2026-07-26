@@ -8,12 +8,16 @@ dependencies, WordPress 6.0+.
 
 ## What it does
 
-- **Secure link to the portal** over an HMAC-signed, per-site channel.
+- **Secure link to the portal** over an HMAC-signed, per-site channel — **both
+  requests AND the portal's responses are signed** (an mTLS-equivalent). The plugin
+  verifies each response with the per-site secret before acting on it, so a forged
+  reply (e.g. a fake SSO redeem trying to log an attacker into wp-admin) is rejected.
 - **Policy & user sync** — the portal is the source of truth; the plugin applies
   the desired login policy and manages users and their roles.
 - **One-click SSO** into wp-admin from the portal.
 - **Event streaming** — sign-ins, updates and plugin changes are reported to the
-  portal's activity log.
+  portal's activity log; the plugin also reports the available WordPress core version
+  so the portal can alert when a site can update.
 - **Self-updates** from this GitHub repository.
 
 ## Connect a site
@@ -31,6 +35,18 @@ the connector and restore standard WordPress login:
 ```php
 define( 'WPGUARD_DISABLE', true );
 ```
+
+## Response-signature enforcement
+
+The plugin verifies the portal's response signatures by default and refuses replies
+that are unsigned or forged. As an **emergency valve only** (e.g. a portal-side rollback
+that temporarily ships unsigned replies), you may accept unsigned responses with:
+
+```php
+define( 'WPGUARD_REQUIRE_RESP_SIG', false );
+```
+
+Leave this ON (the default) in normal operation.
 
 ## License
 
