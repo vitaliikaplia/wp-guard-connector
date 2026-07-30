@@ -48,6 +48,20 @@ define( 'WPGUARD_REQUIRE_RESP_SIG', false );
 
 Leave this ON (the default) in normal operation.
 
+## Cut-loose grace (forged-rejection hardening)
+
+If the portal starts rejecting the site's syncs with an unsigned `401`/`404` — a genuine
+removal (key rotated, site deleted), or an active attacker forging one to strip enforcement
+— the plugin does **not** drop its cached login policy immediately. It suspends only the
+login-page redirect (so the **owner is never trapped**) but keeps direct-password-login
+blocks for a grace window, and restores standard login only once the rejection **persists
+past** the window — or immediately if the portal returns a *signed* cut-loose. The default
+window is one hour; tune it (in seconds) with:
+
+```php
+define( 'WPGUARD_CUTLOOSE_GRACE', 3600 ); // 0 = clear immediately (old behaviour)
+```
+
 ## License
 
 GPL-2.0-or-later

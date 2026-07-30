@@ -3,7 +3,7 @@
  * Plugin Name:       WP Guard Connector
  * Plugin URI:        https://wpguard.top
  * Description:        Connects this WordPress site to the WP Guard portal — secure registration by API key, an HMAC-signed channel, heartbeat, desired-state sync, one-click SSO and event streaming. Self-updates from GitHub.
- * Version:           1.4.0
+ * Version:           1.5.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            WP Guard
@@ -39,12 +39,21 @@ if (defined('WPGUARD_DISABLE') && WPGUARD_DISABLE) {
  * and the register secret. This is on by default. As an EMERGENCY valve only (e.g. a portal
  * rollback that ships unsigned replies), you may put  define('WPGUARD_REQUIRE_RESP_SIG', false);
  * in wp-config.php to temporarily accept unsigned responses. Leave it ON in normal operation.
+ *
+ * Cut-loose debounce: a genuine "the portal removed us" reply is an UNSIGNED 401 (the portal
+ * no longer holds our secret, so it cannot sign it) — indistinguishable from a MITM forging a
+ * 401 to strip enforcement. So we don't wipe the cached security policy on the first one. We
+ * immediately drop only the login-page redirect (the sole hook that could trap the owner, who
+ * is otherwise exempt), keep the password-login blocks for a grace window, and restore standalone
+ * login only once the rejection persists past it (a real signed reply meanwhile resets us). The
+ * owner is never trapped; WPGUARD_DISABLE stays the instant manual escape. Tune the window with
+ * define('WPGUARD_CUTLOOSE_GRACE', <seconds>) (default 3600; 0 = wipe immediately, as before).
  */
 
 /* Plugin identity + self-update source. Version lives in ONE place (the header is
    parsed by WordPress and by the GitHub updater on the remote side). The branch is
    overridable via wp-config for staging channels; default is the release branch. */
-define('WPGUARD_CONNECTOR_VERSION', '1.4.0');
+define('WPGUARD_CONNECTOR_VERSION', '1.5.0');
 define('WPGUARD_CONNECTOR_FILE', __FILE__);
 define('WPGUARD_CONNECTOR_BASENAME', plugin_basename(__FILE__));
 define('WPGUARD_CONNECTOR_GITHUB', 'vitaliikaplia/wp-guard-connector');
@@ -630,6 +639,7 @@ final class WP_Guard_Connector {
             // and must not be rejected by the monotonic gate against a stale value.
             'config_version' => 0,
             'policy'         => array(),
+            'cutloose_since' => 0,
             'last_beat'      => time(),
             'last_status'    => 'registered',
         ));
@@ -650,6 +660,58 @@ final class WP_Guard_Connector {
     private function policy() {
         $s = $this->state();
         return (isset($s['policy']) && is_array($s['policy'])) ? $s['policy'] : array();
+    }
+
+    /** Grace window (seconds) to keep the password-login blocks up after the portal starts
+     *  rejecting our syncs with an UNSIGNED 401/404, before concluding a genuine cut-loose and
+     *  restoring standalone login. Blunts an active MITM forging rejections to strip enforcement
+     *  (it must sustain the forgery for the whole window, not a single tick). The owner is freed
+     *  from the login redirect immediately regardless (register_policy_hooks), so a longer window
+     *  never traps them. Override with define('WPGUARD_CUTLOOSE_GRACE', <seconds>) or the
+     *  'wpguard_cutloose_grace' filter; 0 restores the old wipe-immediately behaviour. */
+    private function cutloose_grace() {
+        $g = defined('WPGUARD_CUTLOOSE_GRACE') ? (int) WPGUARD_CUTLOOSE_GRACE : 3600;
+        return max(0, (int) apply_filters('wpguard_cutloose_grace', $g));
+    }
+
+    /**
+     * PURE decision (no WP calls — unit-tested via php -r, mirroring lib/connector.js's split)
+     * for how a non-200 sync reply mutates enforcement state. `$signed_ok` is true ONLY for a
+     * 404 that carried a VALID portal signature (a trusted cut-loose). Returns the state patch
+     * to merge onto the current state; an empty array leaves enforcement untouched.
+     *   - not 401/404 (429/5xx/…)        → []            (transient; never touch policy)
+     *   - signed 404                      → full clear    (trusted cut-loose → standalone login)
+     *   - unsigned 401/404, first seen    → start clock   (stay degraded; blocks held)
+     *   - unsigned 401/404, within grace  → keep clock    (degraded; redirect already suspended)
+     *   - unsigned 401/404, past grace    → full clear    (persisted → confirmed cut-loose)
+     * @return array
+     */
+    public static function cutloose_patch($code, $signed_ok, array $state, $now, $grace) {
+        if ($code !== 401 && $code !== 404) {
+            return array();
+        }
+        if ($code === 404 && $signed_ok) {
+            return array('policy' => array(), 'config_version' => 0, 'cutloose_since' => 0);
+        }
+        $since = isset($state['cutloose_since']) ? (int) $state['cutloose_since'] : 0;
+        if ($since <= 0) {
+            $since = (int) $now; // first untrusted rejection → start the grace clock
+        }
+        if ((int) $now - $since >= (int) $grace) {
+            return array('policy' => array(), 'config_version' => 0, 'cutloose_since' => 0);
+        }
+        return array('cutloose_since' => $since);
+    }
+
+    /** True iff a signature-VERIFIED response body explicitly declares a cut-loose. The trusted
+     *  instant-clear fast path must rest on authenticated content: the portal's response signature
+     *  covers the body/nonce/ts but NOT the HTTP status line, so a MITM could relabel a genuine
+     *  signed 200 as a 404 (body + valid signature intact) to force an instant enforcement wipe.
+     *  The portal sets cut_loose:true only in its signed 404 body, so a relabelled 200 (a
+     *  desired-state doc) fails this and is debounced instead. Pure — unit-tested via php -r. */
+    public static function body_declares_cutloose($body) {
+        $doc = json_decode((string) $body, true);
+        return is_array($doc) && !empty($doc['cut_loose']);
     }
 
     /**
@@ -675,13 +737,28 @@ final class WP_Guard_Connector {
         $code = wp_remote_retrieve_response_code($res);
         if ($code !== 200) {
             $patch = array('last_beat' => time(), 'last_status' => 'rejected: HTTP ' . $code);
-            if ($code === 401 || $code === 404) {
-                // The portal no longer accepts us (key rotated / site removed) →
-                // stop enforcing a policy we can no longer refresh, so the owner is
-                // never trapped by a site the portal has cut loose.
-                $patch['policy'] = array();
-                $patch['config_version'] = 0;
-            }
+            // A 401/404 is the portal refusing us: a genuine cut-loose (key rotated / site
+            // removed) OR an active MITM forging an unsigned rejection to strip enforcement.
+            // We can't tell them apart by signature — a genuine 401 is unsigned (the portal no
+            // longer holds our secret to sign with). So DON'T wipe the security policy on the
+            // first one: register_policy_hooks un-traps the owner immediately (login redirect
+            // suspended) while the password-login blocks are held for a grace window, and
+            // cutloose_patch() restores standalone login only once the rejection persists past
+            // it. A 404 CAN be signed (secret still present) — honour a valid one as a trusted,
+            // instant cut-loose (with the response-sig valve off we debounce it too, to be safe).
+            // Key the trusted-cut-loose decision off AUTHENTICATED content, never the HTTP
+            // status line — no signature covers it. A MITM can relabel a genuine signed 200
+            // as a 404 (body + valid signature unchanged) to force an instant wipe, so we ALSO
+            // require the signed body to explicitly declare cut_loose. A relabelled 200 body
+            // (a desired-state doc) lacks it → falls through to the debounce path. The portal
+            // emits cut_loose:true only in its signed 404 body (routes/api.js).
+            $signed_ok = ($code === 404) && $this->require_resp_sig()
+                && $this->verify_signed_response($res, $nonce, $this->state()['secret'])
+                && self::body_declares_cutloose(wp_remote_retrieve_body($res));
+            $patch = array_merge(
+                $patch,
+                self::cutloose_patch($code, $signed_ok, $this->state(), time(), $this->cutloose_grace())
+            );
             $this->save_state($patch);
             return array('ok' => false, 'error' => 'HTTP ' . $code);
         }
@@ -698,7 +775,9 @@ final class WP_Guard_Connector {
         if ($events && is_array($doc) && !empty($doc['events_ack'])) {
             $this->drop_events(wp_list_pluck($events, 'uid'));
         }
-        $this->save_state(array('last_beat' => time(), 'last_status' => 'ok'));
+        // A trusted signed 200 is proof the real portal is reachable → leave any degraded
+        // cut-loose state (redirect suspended / grace clock) by resetting the clock.
+        $this->save_state(array('last_beat' => time(), 'last_status' => 'ok', 'cutloose_since' => 0));
         return array('ok' => true);
     }
 
@@ -905,11 +984,20 @@ final class WP_Guard_Connector {
         // connected, independent of policy toggles.
         add_filter('authenticate', array($this, 'enforce_blocked'), 40, 3);
         $policy = $this->policy();
+        // Cut-loose pending: the portal is rejecting our syncs with an unsigned 401/404 (genuine
+        // removal OR a forged MITM rejection). We hold the security-critical authenticate blocks
+        // below through the grace, but SUSPEND the login-page redirect now — it is the one
+        // enforcement hook with no owner exemption, so leaving it up is what would trap the owner.
+        // Dropping it costs nothing: the redirect is UX only; the authenticate filter is the real
+        // password gate and it exempts the owner. (See sync() / cutloose_patch().)
+        $cutloose_pending = ((int) ($this->state()['cutloose_since'] ?? 0)) > 0;
         if (!empty($policy['wp_login_disabled'])) {
             // Redirect the browser login page (UX) AND block password auth at the
             // authenticate layer — the latter also covers xmlrpc.php and REST
             // Application Passwords, which login_init never sees.
-            add_action('login_init', array($this, 'enforce_login_redirect'), 0);
+            if (!$cutloose_pending) {
+                add_action('login_init', array($this, 'enforce_login_redirect'), 0);
+            }
             add_filter('authenticate', array($this, 'enforce_login_disabled'), 30, 1);
         }
         if (!empty($policy['twofa_enforced'])) {
@@ -1158,7 +1246,7 @@ final class WP_Guard_Connector {
         // standard login, not keep redirecting to a portal it no longer talks to.
         $this->save_state(array(
             'site_id' => 0, 'secret' => '', 'policy' => array(), 'config_version' => 0,
-            'event_seq' => 0, 'last_status' => 'disconnected',
+            'cutloose_since' => 0, 'event_seq' => 0, 'last_status' => 'disconnected',
         ));
         $this->redirect_back('disconnected');
     }
