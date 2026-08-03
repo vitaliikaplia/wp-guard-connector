@@ -3,7 +3,7 @@
  * Plugin Name:       WP Guard Connector
  * Plugin URI:        https://wpguard.top
  * Description:        Connects this WordPress site to the WP Guard portal — secure registration by API key, an HMAC-signed channel, heartbeat, desired-state sync, one-click SSO and event streaming. Self-updates from GitHub.
- * Version:           1.5.0
+ * Version:           1.6.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            WP Guard
@@ -53,7 +53,7 @@ if (defined('WPGUARD_DISABLE') && WPGUARD_DISABLE) {
 /* Plugin identity + self-update source. Version lives in ONE place (the header is
    parsed by WordPress and by the GitHub updater on the remote side). The branch is
    overridable via wp-config for staging channels; default is the release branch. */
-define('WPGUARD_CONNECTOR_VERSION', '1.5.0');
+define('WPGUARD_CONNECTOR_VERSION', '1.6.0');
 define('WPGUARD_CONNECTOR_FILE', __FILE__);
 define('WPGUARD_CONNECTOR_BASENAME', plugin_basename(__FILE__));
 define('WPGUARD_CONNECTOR_GITHUB', 'vitaliikaplia/wp-guard-connector');
@@ -719,6 +719,46 @@ final class WP_Guard_Connector {
      * portal's desired-state, reconcile. Replaces the plain heartbeat.
      * @return array{ok:bool,error?:string}
      */
+    /**
+     * The site's own privileged accounts, for the portal's "accounts outside WP
+     * Guard" view. The sync used to be one-way — the portal pushed its roster in
+     * and never learned who else could already reach wp-admin — so an operator
+     * had no way to spot an administrator the portal did not know about.
+     *
+     * Only roles that can actually reach wp-admin are reported, capped, and each
+     * row is flagged when WP Guard itself provisioned the account (wpguard_managed)
+     * so the portal can tell "we made this one" from "this one predates us".
+     * No passwords, no hashes, no capabilities dump — identity only.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    private function site_accounts() {
+        $roles = array('administrator', 'editor', 'shop_manager', 'seo_manager');
+        $out   = array();
+
+        $users = get_users(array(
+            'role__in' => $roles,
+            'number'   => 500,
+            'fields'   => array('ID', 'user_login', 'user_email', 'display_name'),
+            'orderby'  => 'ID',
+        ));
+
+        foreach ($users as $u) {
+            $data = get_userdata($u->ID);
+            $role = ($data && !empty($data->roles)) ? (string) reset($data->roles) : '';
+            $out[] = array(
+                'id'           => (int) $u->ID,
+                'login'        => (string) $u->user_login,
+                'email'        => (string) $u->user_email,
+                'display_name' => (string) $u->display_name,
+                'role'         => $role,
+                'managed'      => get_user_meta($u->ID, 'wpguard_managed', true) ? 1 : 0,
+            );
+        }
+
+        return $out;
+    }
+
     public function sync() {
         // Piggyback any buffered site events (2.5) onto this signed pull.
         $events = $this->peek_events(100);
@@ -728,6 +768,7 @@ final class WP_Guard_Connector {
             'plugin_version' => self::VERSION,
             'config_version' => $this->applied_config_version(),
             'events'         => $events,
+            'wp_users'       => $this->site_accounts(),
         ));
         $res = $r['res']; $nonce = $r['nonce'];
         if (is_wp_error($res)) {
